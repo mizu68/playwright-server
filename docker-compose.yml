@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  nginx:
+    image: openresty/openresty:alpine
+    container_name: playwright-nginx
+    ports:
+      - "${EXTERNAL_PORT:-3000}:80"
+    volumes:
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+    environment:
+      - ALLOWED_TOKENS=${ALLOWED_TOKENS:-default-token}
+      - PLAYWRIGHT_TOKEN=${PLAYWRIGHT_TOKEN:-default-token}
+    depends_on:
+      - playwright-1
+    networks:
+      - playwright-network
+    restart: unless-stopped
+
+  playwright-1:
+    image: mcr.microsoft.com/playwright:v1.54.0-noble
+    container_name: playwright-1
+    command: >
+      sh -c "
+        echo 'Starting Playwright server...' &&
+        npx playwright run-server --port ${INTERNAL_PORT:-3000} --host 0.0.0.0
+      "
+    environment:
+      - PLAYWRIGHT_TOKEN=${PLAYWRIGHT_TOKEN:-default-token}
+      - INTERNAL_PORT=${INTERNAL_PORT:-3000}
+      - NODE_ENV=production
+    networks:
+      - playwright-network
+    restart: unless-stopped
+    # security_opt:
+    #   - seccomp:./seccomp_profile.json
+    ipc: host
+    init: true
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+
+  playwright-worker:
+    image: mcr.microsoft.com/playwright:v1.54.0-noble
+    command: >
+      sh -c "
+        echo 'Starting Playwright server...' &&
+        npx playwright run-server --port ${INTERNAL_PORT:-3000} --host 0.0.0.0
+      "
+    environment:
+      - PLAYWRIGHT_TOKEN=${PLAYWRIGHT_TOKEN:-default-token}
+      - INTERNAL_PORT=${INTERNAL_PORT:-3000}
+      - NODE_ENV=production
+    networks:
+      - playwright-network
+    restart: unless-stopped
+    # security_opt:
+    #   - seccomp:./seccomp_profile.json
+    ipc: host
+    init: true
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+
+networks:
+  playwright-network:
+    driver: bridge
