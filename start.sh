@@ -75,6 +75,8 @@ show_help() {
     echo "  logs [service]       显示日志"
     echo "  scale <number>       扩缩容到指定实例数"
     echo "  health               健康检查"
+    echo "  monitor              启动自动监控服务"
+    echo "  test-health          执行一次健康检查测试"
     echo "  diagnose             诊断问题（显示详细状态和日志）"
     echo "  clean                清理所有容器和网络"
     echo "  help                 显示此帮助信息"
@@ -91,6 +93,25 @@ generate_nginx_config() {
     local instances=${1:-1}
     print_info "生成nginx配置文件 (${instances} 个实例)..."
     
+    # 检查模板文件是否存在
+    if [ ! -f nginx.conf.template ]; then
+        print_error "nginx.conf.template 文件不存在，请检查项目文件"
+        exit 1
+    fi
+    
+    # 定义变量替换函数（纯bash实现，不依赖envsubst）
+    replace_template_variables() {
+        local template_file="$1"
+        local output_file="$2"
+        local internal_port="$3"
+        local allowed_tokens="$4"
+        
+        # 使用 sed 进行变量替换
+        sed -e "s|\${INTERNAL_PORT}|$internal_port|g" \
+            -e "s|\${ALLOWED_TOKENS}|$allowed_tokens|g" \
+            "$template_file" > "$output_file"
+    }
+    
     # 读取环境变量
     if [ -f .env ]; then
         source .env
@@ -98,6 +119,12 @@ generate_nginx_config() {
     
     # 设置默认值
     local internal_port=${INTERNAL_PORT:-3000}
+    local allowed_tokens=${ALLOWED_TOKENS:-"default-token"}
+    
+    # 检查Token配置
+    if [ "$allowed_tokens" = "default-token" ]; then
+        print_warning "使用默认Token，建议在生产环境中使用 ./token-manager.sh add 生成安全Token"
+    fi
     
     # 生成upstream配置
     local upstream_config="    upstream playwright_backend {\n"
@@ -110,12 +137,44 @@ generate_nginx_config() {
     
     upstream_config+="    }"
     
-    # 复制模板并替换upstream配置
-    sed "s/\${INTERNAL_PORT}/$internal_port/g" nginx.conf.template | \
+    # 准备所有环境变量
+    local worker_connections=${WORKER_CONNECTIONS:-1024}
+    local worker_processes=${WORKER_PROCESSES:-auto}
+    local rate_limit_zone_size=${RATE_LIMIT_ZONE_SIZE:-10m}
+    local rate_limit_rate=${RATE_LIMIT_RATE:-20r/s}
+    local rate_limit_burst=${RATE_LIMIT_BURST:-50}
+    local proxy_connect_timeout=${PROXY_CONNECT_TIMEOUT:-30}
+    local proxy_send_timeout=${PROXY_SEND_TIMEOUT:-300}
+    local proxy_read_timeout=${PROXY_READ_TIMEOUT:-600}
+    local log_level=${LOG_LEVEL:-info}
+    
+    # 使用纯bash方式替换环境变量
+    sed -e "s|\${INTERNAL_PORT}|$internal_port|g" \
+        -e "s|\${ALLOWED_TOKENS}|$allowed_tokens|g" \
+        -e "s|\${WORKER_CONNECTIONS}|$worker_connections|g" \
+        -e "s|\${WORKER_PROCESSES}|$worker_processes|g" \
+        -e "s|\${RATE_LIMIT_ZONE_SIZE}|$rate_limit_zone_size|g" \
+        -e "s|\${RATE_LIMIT_RATE}|$rate_limit_rate|g" \
+        -e "s|\${RATE_LIMIT_BURST}|$rate_limit_burst|g" \
+        -e "s|\${PROXY_CONNECT_TIMEOUT}|$proxy_connect_timeout|g" \
+        -e "s|\${PROXY_SEND_TIMEOUT}|$proxy_send_timeout|g" \
+        -e "s|\${PROXY_READ_TIMEOUT}|$proxy_read_timeout|g" \
+        -e "s|\${LOG_LEVEL}|$log_level|g" \
+        nginx.conf.template > nginx.conf.tmp
+    
+    # 替换upstream配置（支持多实例）
     sed "/upstream playwright_backend {/,/}/c\\
-$upstream_config" > nginx.conf
+$upstream_config" nginx.conf.tmp > nginx.conf
+    
+    # 清理临时文件
+    rm -f nginx.conf.tmp
     
     print_success "nginx配置已生成 (内部端口: $internal_port, 实例数: $instances)"
+    
+    # 显示Token信息（安全显示，只显示前12个字符）
+    local token_count=$(echo "$allowed_tokens" | tr ',' '\n' | wc -l | tr -d ' ')
+    local first_token=$(echo "$allowed_tokens" | cut -d',' -f1)
+    print_info "配置的Token数量: $token_count 个，首个Token: ${first_token:0:12}..."
 }
 
 # 启动集群
@@ -308,25 +367,7 @@ scale_cluster() {
 
 # 健康检查
 health_check() {
-    local port=${EXTERNAL_PORT:-3000}
-    
-    print_info "执行健康检查..."
-    
-    if curl -s "http://localhost:${port}/health" > /dev/null; then
-        print_success "服务运行正常"
-        
-        # 显示访问信息
-        echo ""
-        print_info "服务访问信息:"
-        echo "  健康检查: http://localhost:${port}/health"
-        echo "  API访问:  http://localhost:${port}/"
-        echo "  认证Token: ${PLAYWRIGHT_TOKEN:-default-token}"
-        echo ""
-    else
-        print_error "服务健康检查失败"
-        print_info "请检查服务状态："
-        show_status
-    fi
+    enhanced_health_check
 }
 
 # 诊断问题
@@ -396,6 +437,111 @@ diagnose_issues() {
     print_info "诊断完成！"
 }
 
+# 启动监控服务
+start_monitor() {
+    print_info "启动 Playwright 监控服务..."
+    
+    # 检查监控脚本是否存在
+    if [ ! -f monitor.sh ]; then
+        print_error "monitor.sh 脚本不存在"
+        print_info "请确保 monitor.sh 文件在当前目录中"
+        exit 1
+    fi
+    
+    # 检查服务是否运行
+    if ! docker compose ps | grep -q "Up"; then
+        print_warning "检测到服务未运行，是否先启动服务？(y/N)"
+        read -p "> " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            start_cluster
+        else
+            print_info "监控需要服务运行才能生效"
+        fi
+    fi
+    
+    # 启动监控
+    ./monitor.sh start
+}
+
+# 执行健康检查测试
+test_health_check() {
+    print_info "执行健康检查测试..."
+    
+    if [ ! -f monitor.sh ]; then
+        print_error "monitor.sh 脚本不存在"
+        exit 1
+    fi
+    
+    ./monitor.sh test
+}
+
+# 增强的健康检查
+enhanced_health_check() {
+    local port=${EXTERNAL_PORT:-3000}
+    
+    print_info "执行增强健康检查..."
+    
+    # 1. 基本健康检查
+    if curl -s "http://localhost:${port}/health" > /dev/null; then
+        print_success "✓ 主服务健康检查通过"
+    else
+        print_error "✗ 主服务健康检查失败"
+        return 1
+    fi
+    
+    # 2. WebSocket健康检查  
+    if curl -s "http://localhost:${port}/ws-health" > /dev/null; then
+        print_success "✓ WebSocket健康检查通过"
+    else
+        print_warning "⚠ WebSocket健康检查失败"
+    fi
+    
+    # 3. 容器健康状态
+    print_info "容器健康状态："
+    for container in playwright-nginx playwright-1; do
+        if docker ps --format "{{.Names}}" | grep -q "$container"; then
+            local health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "no-healthcheck")
+            if [ "$health" = "healthy" ] || [ "$health" = "no-healthcheck" ]; then
+                print_success "✓ $container: $health"
+            else
+                print_warning "⚠ $container: $health"
+            fi
+        else
+            print_error "✗ $container: 未运行"
+        fi
+    done
+    
+    # 4. 资源使用检查
+    print_info "资源使用情况："
+    docker stats --no-stream --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}" | head -5
+    
+    # 5. 网络连通性
+    print_info "网络连通性测试："
+    if docker compose exec -T nginx ping -c 1 playwright-1 > /dev/null 2>&1; then
+        print_success "✓ nginx -> playwright-1 连接正常"
+    else
+        print_warning "⚠ nginx -> playwright-1 连接异常"
+    fi
+    
+    # 显示访问信息
+    echo ""
+    print_info "服务访问信息："
+    echo "  健康检查: http://localhost:${port}/health"
+    echo "  WebSocket: http://localhost:${port}/ws-health" 
+    echo "  主服务:   http://localhost:${port}/"
+    echo ""
+    
+    # 如果有Token配置，显示第一个Token
+    if [ -f .env ]; then
+        source .env
+        if [ -n "$ALLOWED_TOKENS" ]; then
+            local first_token=$(echo "$ALLOWED_TOKENS" | cut -d',' -f1)
+            echo "  测试命令: curl -H \"Authorization: Bearer ${first_token:0:12}...\" http://localhost:${port}/health"
+        fi
+    fi
+}
+
 # 清理
 clean_cluster() {
     print_warning "这将删除所有容器、网络和卷"
@@ -437,6 +583,12 @@ main() {
             ;;
         health)
             health_check
+            ;;
+        monitor)
+            start_monitor
+            ;;
+        test-health)
+            test_health_check
             ;;
         clean)
             clean_cluster

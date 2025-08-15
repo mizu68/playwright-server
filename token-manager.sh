@@ -55,7 +55,7 @@ update_tokens_in_env() {
     
     if [ -f .env ]; then
         # 备份原文件
-        cp .env .env.backup
+        cp .env .env.backup-$(date +%Y%m%d-%H%M%S)
         
         # 更新ALLOWED_TOKENS
         if grep -q "^ALLOWED_TOKENS=" .env; then
@@ -65,9 +65,26 @@ update_tokens_in_env() {
         fi
         
         rm -f .env.bak
+        print_info "配置已更新，需要重新生成nginx配置并重启服务"
+        print_info "运行: ./start.sh restart"
     else
-        print_error ".env 文件不存在"
-        exit 1
+        # 如果 .env 不存在，从示例文件创建
+        if [ -f .env.example ]; then
+            print_info "创建.env文件从.env.example"
+            cp .env.example .env
+            # 更新Token
+            if grep -q "^ALLOWED_TOKENS=" .env; then
+                sed -i.bak "s|^ALLOWED_TOKENS=.*|ALLOWED_TOKENS=$new_tokens|" .env
+            else
+                echo "ALLOWED_TOKENS=$new_tokens" >> .env
+            fi
+            rm -f .env.bak
+            print_success ".env文件已创建并配置Token"
+        else
+            print_error ".env 和 .env.example 文件都不存在"
+            print_info "请先创建.env配置文件"
+            exit 1
+        fi
     fi
 }
 
